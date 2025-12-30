@@ -1,0 +1,352 @@
+const express = require("express");
+const { supabase } = require("../config/supabase");
+const db = require("../config/database");
+const mqttService = require("../services/mqttService");
+
+const router = express.Router();
+const USE_SUPABASE = process.env.USE_SUPABASE === "true";
+
+// Manual payment status update (for testing only - use when webhook can't reach your localhost)
+router.post("/update-payment/:orderId", async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { status } = req.body; // SUCCESS, FAILED, PENDING
+
+    console.log(`🔧 Manual payment update for ${orderId}: ${status}`);
+
+    const paymentStatus = status || "SUCCESS";
+    const orderStatus = paymentStatus === "SUCCESS" ? "PAID" : "FAILED";
+    const now = new Date().toISOString();
+
+    if (USE_SUPABASE) {
+      // Update payment
+      const { error: paymentError } = await supabase
+        .from("payments")
+        .update({
+          status: paymentStatus,
+          gateway_transaction_id: "MANUAL_TEST",
+          payment_type: "manual",
+          processed_at: now,
+        })
+        .eq("order_id", orderId);
+
+      if (paymentError) {
+        console.error("Payment update error:", paymentError);
+        throw paymentError;
+      }
+
+      // Update order
+      const updateData = {
+        status: orderStatus,
+      };
+
+      if (paymentStatus === "SUCCESS") {
+        updateData.paid_at = now;
+      }
+
+      const { error: orderError } = await supabase
+        .from("orders")
+        .update(updateData)
+        .eq("id", orderId);
+
+      if (orderError) {
+        console.error("Order update error:", orderError);
+        throw orderError;
+      }
+
+      console.log(`✅ Payment manually updated: ${orderId} → ${paymentStatus}`);
+    } else {
+      // MySQL implementation
+      await db.query(
+        `UPDATE payments 
+         SET status = ?, gateway_transaction_id = ?, payment_type = ?, processed_at = NOW()
+         WHERE order_id = ?`,
+        [paymentStatus, "MANUAL_TEST", "manual", orderId]
+      );
+
+      const paid_at = paymentStatus === "SUCCESS" ? "NOW()" : "NULL";
+      await db.query(
+        `UPDATE orders 
+         SET status = ?, paid_at = ${paid_at}
+         WHERE id = ?`,
+        [orderStatus, orderId]
+      );
+
+      console.log(`✅ Payment manually updated: ${orderId} → ${paymentStatus}`);
+    }
+
+    res.json({
+      success: true,
+      orderId,
+      paymentStatus,
+      orderStatus,
+      message: "Payment status updated successfully (manual)",
+    });
+  } catch (error) {
+    console.error("❌ Manual update error:", error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// Get order details (for debugging)
+router.get("/order/:orderId", async (req, res) => {
+  try {
+    const { orderId } = req.params;
+
+    if (USE_SUPABASE) {
+      const { data, error } = await supabase
+        .from("orders")
+        .select(
+          `
+          *,
+          products (*),
+          slots (*),
+          payments (*)
+        `
+        )
+        .eq("id", orderId)
+        .single();
+
+      if (error) {
+        throw error;
+      }
+
+      res.json({
+        success: true,
+        order: data,
+      });
+    } else {
+      const order = await db.query(
+        `SELECT o.*, 
+                p.name as product_name,
+                s.slot_number,
+                pay.status as payment_status,
+                pay.gateway_transaction_id
+         FROM orders o
+         LEFT JOIN products p ON o.product_id = p.id
+         LEFT JOIN slots s ON o.slot_id = s.id
+         LEFT JOIN payments pay ON o.id = pay.order_id
+         WHERE o.id = ?`,
+        [orderId]
+      );
+
+      res.json({
+        success: true,
+        order: order[0] || null,
+      });
+    }
+  } catch (error) {
+    console.error("❌ Get order error:", error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// List all pending payments (for debugging)
+router.get("/pending-payments", async (req, res) => {
+  try {
+    if (USE_SUPABASE) {
+      const { data, error } = await supabase
+        .from("orders")
+        .select(
+          `
+          *,
+          products (name),
+          payments (*)
+        `
+        )
+        .eq("status", "PENDING")
+        .order("created_at", { ascending: false })
+        .limit(20);
+
+      if (error) {
+        throw error;
+      }
+
+      res.json({
+        success: true,
+        count: data.length,
+        orders: data,
+      });
+    } else {
+      const orders = await db.query(
+        `SELECT o.*, 
+                p.name as product_name,
+                pay.status as payment_status,
+                pay.gateway_transaction_id
+         FROM orders o
+         LEFT JOIN products p ON o.product_id = p.id
+         LEFT JOIN payments pay ON o.id = pay.order_id
+         WHERE o.status = 'PENDING'
+         ORDER BY o.created_at DESC
+         LIMIT 20`
+      );
+
+      res.json({
+        success: true,
+        count: orders.length,
+        orders,
+      });
+    }
+  } catch (error) {
+    console.error("❌ Get pending payments error:", error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// MQTT Status and Testing Endpoints
+router.get("/mqtt/status", (req, res) => {
+  res.json({
+    success: true,
+    mqtt: {
+      connected: mqttService.isConnected,
+      broker: process.env.MQTT_BROKER_URL || "mqtt://localhost:1883",
+      machineId: process.env.MACHINE_ID || "VM01",
+    },
+  });
+});
+
+// Test MQTT publish (send test command to ESP32)
+router.post("/mqtt/test-command", (req, res) => {
+  try {
+    const machineId = req.body.machineId || process.env.MACHINE_ID || "VM01";
+    const testCommand = {
+      cmd: "test",
+      timestamp: new Date().toISOString(),
+      message: "Test command from backend",
+    };
+
+    if (!mqttService.isConnected) {
+      return res.status(503).json({
+        success: false,
+        error: "MQTT not connected",
+      });
+    }
+
+    const published = mqttService.publishDispenseCommand(
+      machineId,
+      testCommand
+    );
+
+    res.json({
+      success: published,
+      command: testCommand,
+      topic: `vm/${machineId}/command`,
+      message: published
+        ? "Test command published successfully"
+        : "Failed to publish command",
+    });
+  } catch (error) {
+    console.error("❌ MQTT test command error:", error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// Simulate ESP32 dispense result (for testing without actual ESP32)
+router.post("/mqtt/simulate-dispense-result", async (req, res) => {
+  try {
+    const {
+      orderId,
+      slot = 1,
+      success = true,
+      dropDetected = true,
+      durationMs = 1850,
+      error = null,
+    } = req.body;
+
+    if (!orderId) {
+      return res.status(400).json({
+        success: false,
+        error: "orderId is required",
+      });
+    }
+
+    const machineId = process.env.MACHINE_ID || "VM01";
+
+    // Manually call the handler that would normally be triggered by MQTT
+    const result = {
+      orderId,
+      slot,
+      success,
+      dropDetected,
+      durationMs,
+      error,
+    };
+
+    await mqttService.handleDispenseResult(machineId, result);
+
+    res.json({
+      success: true,
+      message: "Dispense result simulated successfully",
+      result,
+    });
+  } catch (error) {
+    console.error("❌ Simulate dispense result error:", error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+
+
+// Get latest orders (debug all statuses)
+router.get("/latest-orders", async (req, res) => {
+  try {
+    if (USE_SUPABASE) {
+      const { data, error } = await supabase
+        .from("orders")
+        .select("*, payments(status, payment_type)")
+        .order("created_at", { ascending: false })
+        .limit(10);
+
+      if (error) throw error;
+      res.json({ success: true, orders: data });
+    } else {
+      const orders = await db.query(
+        "SELECT o.*, p.status as payment_status from orders o LEFT JOIN payments p ON o.id = p.order_id ORDER BY o.created_at DESC LIMIT 10"
+      );
+      res.json({ success: true, orders });
+    }
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+// List tables
+router.get("/tables", async (req, res) => {
+  try {
+    // Attempt to query information_schema via RPC or direct select if permissions allow
+    // Since we can't easily run SQL, we'll try to just check if 'users' exists by select
+    const { data, error } = await supabase
+      .from("users")
+      .select("count", { count: "exact", head: true });
+      
+    if (error) {
+        return res.json({ 
+            exists: false, 
+            error: error 
+        });
+    }
+    
+    res.json({ exists: true, count: data });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+module.exports = router;
