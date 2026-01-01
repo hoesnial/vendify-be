@@ -8,6 +8,9 @@ const USE_SUPABASE = process.env.USE_SUPABASE === "true";
 
 const router = express.Router();
 
+// Set to true after applying src/database/migrations/02_stock_trigger.sql
+const USE_DB_TRIGGER = false;
+
 // Validate dispense request
 const validateDispense = [
   body("order_id").notEmpty().withMessage("Order ID is required"),
@@ -309,10 +312,12 @@ router.post("/confirm", validateDispense, async (req, res) => {
           const newStock = oldStock - orderData.quantity;
 
           // Update stock
-          await supabase
-            .from("slots")
-            .update({ current_stock: newStock })
-            .eq("id", orderData.slot_id);
+          if (!USE_DB_TRIGGER) {
+            await supabase
+              .from("slots")
+              .update({ current_stock: newStock })
+              .eq("id", orderData.slot_id);
+          }
 
           // Log stock change
           await supabase.from("stock_logs").insert({

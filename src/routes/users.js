@@ -30,6 +30,11 @@ const validateLogin = [
  * @desc    Register new user (buyer)
  * @access  Public
  */
+/**
+ * @route   POST /api/users/register
+ * @desc    Register new user (buyer)
+ * @access  Public
+ */
 router.post("/register", validateRegister, async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -43,9 +48,9 @@ router.post("/register", validateRegister, async (req, res) => {
 
     const { email, password, full_name, phone } = req.body;
 
-    // Check if user already exists
+    // Check if user already exists (in admin_users)
     const { data: existingUser } = await supabase
-      .from("users")
+      .from("admin_users")
       .select("email")
       .eq("email", email)
       .single();
@@ -60,15 +65,17 @@ router.post("/register", validateRegister, async (req, res) => {
     // Hash password
     const password_hash = await bcrypt.hash(password, 10);
 
-    // Create user
+    // Create user in admin_users
     const { data: newUser, error } = await supabase
-      .from("users")
+      .from("admin_users")
       .insert({
         email,
+        username: email, // Use email as username for customers initially
         password_hash,
         full_name,
         phone,
         role: "buyer", // Default role
+        is_active: true
       })
       .select("id, email, full_name, phone, role, created_at")
       .single();
@@ -120,11 +127,12 @@ router.post("/login", validateLogin, async (req, res) => {
 
     const { email, password, fcm_token } = req.body;
 
-    // Find user
+    // Find user in admin_users
+    // Try to match email against email OR username columns for flexibility
     const { data: user, error } = await supabase
-      .from("users")
+      .from("admin_users")
       .select("*")
-      .eq("email", email)
+      .or(`email.eq.${email},username.eq.${email}`)
       .eq("is_active", true)
       .single();
 
@@ -144,13 +152,15 @@ router.post("/login", validateLogin, async (req, res) => {
       });
     }
 
-    // Update last login and FCM token
+    // Update last login and FCM token (if exists)
+    // admin_users has last_login. It might NOT have fcm_token unless migration ran perfectly.
+    // We added fcm_token in migration, so it should be fine.
     const updates = { last_login: new Date().toISOString() };
     if (fcm_token) {
       updates.fcm_token = fcm_token;
     }
 
-    await supabase.from("users").update(updates).eq("id", user.id);
+    await supabase.from("admin_users").update(updates).eq("id", user.id);
 
     // Generate JWT token
     const token = jwt.sign(
@@ -190,8 +200,8 @@ router.post("/login", validateLogin, async (req, res) => {
 router.get("/profile", authenticateToken, async (req, res) => {
   try {
     const { data: user, error } = await supabase
-      .from("users")
-      .select("id, email, full_name, phone, role, created_at, last_login")
+      .from("admin_users")
+      .select("id, email, username, full_name, phone, role, created_at, last_login")
       .eq("id", req.user.id)
       .single();
 
@@ -231,7 +241,7 @@ router.put("/profile", authenticateToken, async (req, res) => {
     if (fcm_token) updates.fcm_token = fcm_token;
 
     const { data: updatedUser, error } = await supabase
-      .from("users")
+      .from("admin_users")
       .update(updates)
       .eq("id", req.user.id)
       .select("id, email, full_name, phone, role")
@@ -283,9 +293,9 @@ router.put(
 
       const { current_password, new_password } = req.body;
 
-      // Get current user
+      // Get current user from admin_users
       const { data: user } = await supabase
-        .from("users")
+        .from("admin_users")
         .select("password_hash")
         .eq("id", req.user.id)
         .single();
@@ -307,7 +317,7 @@ router.put(
 
       // Update password
       const { error } = await supabase
-        .from("users")
+        .from("admin_users")
         .update({ password_hash: new_password_hash })
         .eq("id", req.user.id);
 

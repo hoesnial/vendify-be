@@ -162,11 +162,14 @@ CREATE INDEX IF NOT EXISTS idx_telemetry_machine_time ON telemetry(machine_id, r
 -- ============================================
 CREATE TABLE IF NOT EXISTS admin_users (
   id SERIAL PRIMARY KEY,
-  username VARCHAR(50) UNIQUE NOT NULL,
+  username VARCHAR(50) UNIQUE, -- Nullable for customers
   email VARCHAR(100) UNIQUE NOT NULL,
   password_hash VARCHAR(255) NOT NULL,
-  role VARCHAR(20) DEFAULT 'ADMIN' CHECK (role IN ('SUPER_ADMIN', 'ADMIN', 'TECHNICIAN')),
+  role VARCHAR(20) DEFAULT 'buyer' CHECK (role IN ('SUPER_ADMIN', 'ADMIN', 'TECHNICIAN', 'INVENTORY', 'AUDITOR', 'buyer', 'user', 'BUYER')),
   is_active BOOLEAN DEFAULT TRUE,
+  full_name VARCHAR(100),
+  phone VARCHAR(50),
+  fcm_token TEXT,
   last_login TIMESTAMPTZ,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -331,3 +334,28 @@ CREATE TABLE IF NOT EXISTS temperature_logs (
 );
 
 COMMENT ON TABLE temperature_logs IS 'Historical temperature readings from machines';
+-- ============================================
+-- TRIGGER: Auto-update slots stock from stock_logs
+-- ============================================
+
+CREATE OR REPLACE FUNCTION update_stock_from_log()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Update the current_stock in slots table
+    -- quantity_change contains the delta (negative for dispense, positive for restock)
+    UPDATE slots
+    SET current_stock = current_stock + NEW.quantity_change,
+        updated_at = NOW()
+    WHERE id = NEW.slot_id;
+    
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Drop trigger if exists to allow safe re-run
+DROP TRIGGER IF EXISTS trigger_update_stock_from_log ON stock_logs;
+
+CREATE TRIGGER trigger_update_stock_from_log
+AFTER INSERT ON stock_logs
+FOR EACH ROW
+EXECUTE FUNCTION update_stock_from_log();

@@ -29,16 +29,24 @@ router.post("/login", validateLogin, async (req, res) => {
       });
     }
 
-    const { username, password } = req.body;
+    const { username, password, email } = req.body;
+    
+    // Allow login with either username or email
+    // If username is not provided, try to use email as identifier
+    const identifier = username || email;
+
+    if (!identifier) {
+      return res.status(400).json({ error: "Username or Email is required" });
+    }
 
     let userInfo;
 
     if (USE_SUPABASE) {
-      // Supabase: Find user
+      // Supabase: Find user by username OR email
       const { data: userData, error } = await supabase
         .from("admin_users")
         .select("*")
-        .eq("username", username)
+        .or(`username.eq.${identifier},email.eq.${identifier}`)
         .eq("is_active", true)
         .single();
 
@@ -52,8 +60,8 @@ router.post("/login", validateLogin, async (req, res) => {
     } else {
       // MySQL: Find user
       const user = await db.query(
-        `SELECT * FROM admin_users WHERE username = ? AND is_active = 1`,
-        [username]
+        `SELECT * FROM admin_users WHERE (username = ? OR email = ?) AND is_active = 1`,
+        [identifier, identifier]
       );
 
       if (user.length === 0) {

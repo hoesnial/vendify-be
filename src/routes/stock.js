@@ -4,6 +4,9 @@ const db = require("../config/database");
 
 const router = express.Router();
 
+// Set to true after applying src/database/migrations/02_stock_trigger.sql
+const USE_DB_TRIGGER = false;
+
 // Validation middleware
 const validateStockUpdate = [
   body("slot_id").isInt({ min: 1 }).withMessage("Valid slot_id is required"),
@@ -183,12 +186,14 @@ router.post("/update", validateStockUpdate, async (req, res) => {
       }
 
       // Update slot stock
-      const { error: updateError } = await supabase
-        .from("slots")
-        .update({ current_stock: quantity_after })
-        .eq("id", slot_id);
+      if (!USE_DB_TRIGGER) {
+        const { error: updateError } = await supabase
+          .from("slots")
+          .update({ current_stock: quantity_after })
+          .eq("id", slot_id);
 
-      if (updateError) throw updateError;
+        if (updateError) throw updateError;
+      }
 
       // Log stock change
       const { error: logError } = await supabase
