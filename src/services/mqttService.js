@@ -13,6 +13,7 @@ class MqttService {
     try {
       const brokerUrl = process.env.MQTT_BROKER_URL || "ws://broker.emqx.io:8083/mqtt";
       const options = {
+        clientId: 'backend_' + Math.random().toString(16).substr(2, 8),
         username: process.env.MQTT_USERNAME,
         password: process.env.MQTT_PASSWORD,
         reconnectPeriod: 5000,
@@ -38,6 +39,7 @@ class MqttService {
       });
 
       this.client.on("message", (topic, message) => {
+        console.log(`🔍 DEBUG: Raw MQTT Packet on [${topic}]`);
         this.handleMessage(topic, message);
       });
     } catch (error) {
@@ -47,11 +49,13 @@ class MqttService {
 
   setupSubscriptions() {
     const machineId = process.env.MACHINE_ID || "VM01";
+    console.log(`ℹ️ Configured Machine ID: '${machineId}'`); // Check for spaces/quotes
 
     // Subscribe to topics
     const topics = [
       `vm/${machineId}/telemetry`,
       `vm/${machineId}/dispense_result`,
+      `vm/+/dispense_result`, // Wildcard debug
       `vm/${machineId}/status`,
     ];
 
@@ -219,7 +223,7 @@ class MqttService {
 
   async handleDispenseResult(machineId, data) {
     try {
-      const {
+      let {
         orderId,
         slot,
         success,
@@ -227,6 +231,31 @@ class MqttService {
         durationMs,
         error: errorMsg,
       } = data;
+
+      // Default values for missing fields (Robustness Fix)
+      if (dropDetected === undefined) dropDetected = success; 
+      if (!durationMs) durationMs = 0;
+
+      // Auto-fetch slot if missing (Crucial for Mobile/Simulated payloads)
+      if (!slot) {
+         if (db.useSupabase) {
+             const { supabase } = require("../config/supabase");
+             const { data: orderData } = await supabase
+                 .from('orders')
+                 .select('slot_id, slots(slot_number)')
+                 .eq('id', orderId)
+                 .single();
+             
+             if (orderData) {
+                 slot = orderData.slots?.slot_number || orderData.slot_id;
+                 console.log(`🔧 Auto-detected Slot for ${orderId}: ${slot}`);
+             }
+         } else {
+             // MySQL fallback logic (simplified)
+             const order = await db.query('SELECT slot_id FROM orders WHERE id = ?', [orderId]);
+             if(order.length > 0) slot = order[0].slot_id;
+         }
+      }
 
       console.log("🎰 Processing dispense result:", {
         orderId,
@@ -303,6 +332,14 @@ class MqttService {
             .eq("id", orderId)
             .single();
 
+          if (orderError) {
+             console.error("❌ Error fetching order for stock update:", orderError);
+          } else if (!order) {
+             console.error("❌ Order not found for stock update");
+          } else {
+             console.log(`✅ Order found for stock update: Slot ${order.slot_id}, Qty ${order.quantity}`);
+          }
+
           if (!orderError && order) {
             // Get current slot stock
             const { data: slotData, error: slotError } = await supabase
@@ -311,6 +348,12 @@ class MqttService {
               .eq("id", order.slot_id)
               .eq("machine_id", machineId)
               .single();
+
+            if (slotError) {
+              console.error("❌ Error fetching slot for stock update:", slotError);
+            } else if (!slotData) {
+              console.error(`❌ Slot not found: ID ${order.slot_id} Machine ${machineId}`);
+            }
 
             if (!slotError && slotData) {
               const quantityBefore = slotData.current_stock;
@@ -411,7 +454,8 @@ class MqttService {
           orderStatus = "COMPLETED";
 
           // Update stock
-          await db.query(
+          console.log(`Checking stock update for Order: ${orderId}, Machine: ${machineId}`);
+          const stockResult = await db.query(
             `
             UPDATE slots s
             JOIN orders o ON s.id = o.slot_id
@@ -420,6 +464,8 @@ class MqttService {
           `,
             [orderId, machineId]
           );
+          
+          console.log("Stock update result:", stockResult);
 
           // Log stock change
           await db.query(
@@ -524,7 +570,7 @@ class MqttService {
       return false;
     }
 
-    const topic = `vm/${machineId}/command`;
+    const topic = `vm/${machineId}/dispend`;
     const message = JSON.stringify(command);
 
     this.client.publish(topic, message, { qos: 1 }, (err) => {

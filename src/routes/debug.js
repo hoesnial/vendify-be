@@ -284,7 +284,16 @@ router.post("/mqtt/simulate-dispense-result", async (req, res) => {
       error,
     };
 
+    // 1. Process internally (Update DB)
     await mqttService.handleDispenseResult(machineId, result);
+
+    // 2. Publish to MQTT (So Frontend/Mobile UI updates)
+    if (mqttService.isConnected) {
+        const topic = `vm/${machineId}/dispense_result`;
+        const payload = JSON.stringify(result);
+        mqttService.client.publish(topic, payload, { qos: 1, retain: false });
+        console.log(`📤 Simulated Result published to ${topic}`);
+    }
 
     res.json({
       success: true,
