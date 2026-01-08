@@ -575,7 +575,7 @@ router.put("/:id", upload.single("image"), async (req, res) => {
           console.log("✅ New image uploaded to Supabase Storage:", publicUrl);
         } catch (uploadError) {
           console.error("❌ Supabase Storage upload failed:", uploadError);
-          throw new Error("Failed to upload image to storage");
+          throw new Error("Failed to upload image: " + uploadError.message);
         }
       } else {
         // Delete old local image if exists
@@ -694,6 +694,8 @@ router.put("/:id", upload.single("image"), async (req, res) => {
 
     res.status(500).json({
       error: "Failed to update product",
+      details: error.message, // Exposed for debugging
+      fullError: error
     });
   }
 });

@@ -55,7 +55,6 @@ class MqttService {
     const topics = [
       `vm/${machineId}/telemetry`,
       `vm/${machineId}/dispense_result`,
-      `vm/+/dispense_result`, // Wildcard debug
       `vm/${machineId}/status`,
     ];
 
@@ -290,6 +289,11 @@ class MqttService {
           .eq("slot_number", slot)
           .single();
 
+        if (existingLog && existingLog.success) {
+           console.log("⚠️ Dispense already processed successfully. Skipping duplicate stock update.");
+           return;
+        }
+
         if (existingLog) {
           // Update existing log
           console.log("💾 Updating existing dispense log...");
@@ -302,9 +306,7 @@ class MqttService {
               duration_ms: durationMs,
               error_message: errorMsg,
             })
-            .eq("order_id", orderId)
-            .eq("machine_id", machineId)
-            .eq("slot_number", slot);
+            .eq("id", existingLog.id); // Use ID for safer update
           console.log("✅ Dispense log updated");
         } else {
           // Create new log (for mobile-initiated dispense)
@@ -325,77 +327,75 @@ class MqttService {
 
         if (orderStatus === "COMPLETED") {
           console.log("🔄 Processing stock update...");
-          // Get order details to update stock
-          const { data: order, error: orderError } = await supabase
-            .from("orders")
-            .select("slot_id, quantity")
-            .eq("id", orderId)
-            .single();
-
-          if (orderError) {
-             console.error("❌ Error fetching order for stock update:", orderError);
-          } else if (!order) {
-             console.error("❌ Order not found for stock update");
-          } else {
-             console.log(`✅ Order found for stock update: Slot ${order.slot_id}, Qty ${order.quantity}`);
-          }
-
-          if (!orderError && order) {
-            // Get current slot stock
-            const { data: slotData, error: slotError } = await supabase
-              .from("slots")
-              .select("current_stock")
-              .eq("id", order.slot_id)
-              .eq("machine_id", machineId)
-              .single();
-
-            if (slotError) {
-              console.error("❌ Error fetching slot for stock update:", slotError);
-            } else if (!slotData) {
-              console.error(`❌ Slot not found: ID ${order.slot_id} Machine ${machineId}`);
-            }
-
-            if (!slotError && slotData) {
-              const quantityBefore = slotData.current_stock;
-              const newStock = Math.max(0, quantityBefore - order.quantity);
-
-              console.log("📦 Stock update:", {
-                quantityBefore,
-                quantityChange: -order.quantity,
-                newStock,
-              });
-
-              // Update stock
-              await supabase
+          
+          // Check if order is ALREADY completed to prevent double decrement
+          const { data: currentOrder } = await supabase
+             .from("orders")
+             .select("status, slot_id, quantity")
+             .eq("id", orderId)
+             .single();
+             
+          if (currentOrder && (currentOrder.status === 'COMPLETED' || currentOrder.status === 'DISPENSED')) {
+             console.log(`⚠️ Order ${orderId} is already COMPLETED. Skipping stock decrement.`);
+          } else if (currentOrder) {
+              // Proceed with stock update using currentOrder data
+              const order = currentOrder; // Use the fetched data
+              
+              // Get current slot stock
+              const { data: slotData, error: slotError } = await supabase
                 .from("slots")
-                .update({ current_stock: newStock })
+                .select("current_stock")
                 .eq("id", order.slot_id)
-                .eq("machine_id", machineId);
+                .eq("machine_id", machineId)
+                .single();
 
-              // Log stock change
-              await supabase.from("stock_logs").insert({
-                machine_id: machineId,
-                slot_id: order.slot_id,
-                change_type: "DISPENSE",
-                quantity_before: quantityBefore,
-                quantity_after: newStock,
-                quantity_change: -order.quantity,
-                reason: `Order ${orderId}`,
-              });
+              if (slotError) {
+                console.error("❌ Error fetching slot for stock update:", slotError);
+              } else if (!slotData) {
+                console.error(`❌ Slot not found: ID ${order.slot_id} Machine ${machineId}`);
+              }
 
-              console.log("✅ Stock updated successfully");
-            }
+              if (!slotError && slotData) {
+                const quantityBefore = slotData.current_stock;
+                const newStock = Math.max(0, quantityBefore - order.quantity);
+
+                console.log("📦 Stock update:", {
+                  quantityBefore,
+                  quantityChange: -order.quantity,
+                  newStock,
+                });
+
+                // Update stock
+                await supabase
+                  .from("slots")
+                  .update({ current_stock: newStock })
+                  .eq("id", order.slot_id)
+                  .eq("machine_id", machineId);
+
+                // Log stock change
+                await supabase.from("stock_logs").insert({
+                  machine_id: machineId,
+                  slot_id: order.slot_id,
+                  change_type: "DISPENSE",
+                  quantity_before: quantityBefore,
+                  quantity_after: newStock,
+                  quantity_change: -order.quantity,
+                  reason: `Order ${orderId}`,
+                });
+
+                console.log("✅ Stock updated successfully");
+              }
+              
+              console.log("💾 Updating order status to:", orderStatus);
+              // Update order status
+              const updateData = { status: orderStatus };
+              if (orderStatus === "COMPLETED") {
+                updateData.dispensed_at = new Date().toISOString();
+              }
+              await supabase.from("orders").update(updateData).eq("id", orderId);
+              console.log("✅ Order status updated");
           }
         }
-
-        console.log("💾 Updating order status to:", orderStatus);
-        // Update order status
-        const updateData = { status: orderStatus };
-        if (orderStatus === "COMPLETED") {
-          updateData.dispensed_at = new Date().toISOString();
-        }
-        await supabase.from("orders").update(updateData).eq("id", orderId);
-        console.log("✅ Order status updated");
       } else {
         // MySQL implementation
 
