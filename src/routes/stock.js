@@ -5,14 +5,14 @@ const db = require("../config/database");
 const router = express.Router();
 
 // Set to true after applying src/database/migrations/02_stock_trigger.sql
-const USE_DB_TRIGGER = false;
+const USE_DB_TRIGGER = true;
 
 // Validation middleware
 const validateStockUpdate = [
   body("slot_id").isInt({ min: 1 }).withMessage("Valid slot_id is required"),
   body("quantity").isInt({ min: 0 }).withMessage("Valid quantity is required"),
   body("change_type")
-    .isIn(["RESTOCK", "MANUAL_ADJUST", "AUDIT"])
+    .isIn(["RESTOCK", "MANUAL_ADJUST", "AUDIT", "REMOVE"])
     .withMessage("Valid change_type is required"),
   body("reason")
     .optional()
@@ -149,6 +149,7 @@ router.post("/update", validateStockUpdate, async (req, res) => {
       quantity,
       change_type,
       reason,
+      expected_current_stock, // OCC Value
       performed_by = "system",
     } = req.body;
 
@@ -169,7 +170,71 @@ router.post("/update", validateStockUpdate, async (req, res) => {
           return res.status(404).json({ error: "Slot not found" });
       }
 
+      // OPTIMISTIC CONCURRENCY CHECK
+      if (expected_current_stock !== undefined) {
+          if (Number(expected_current_stock) !== Number(slotInfo.current_stock)) {
+              console.warn(`[StockUpdate] OCC Mismatch. Exp: ${expected_current_stock}, Act: ${slotInfo.current_stock}`);
+              return res.status(409).json({
+                  error: "Data has changed",
+                  message: "Stok telah berubah di server. Silakan refresh dan coba lagi.",
+                  current_stock: slotInfo.current_stock
+              });
+          }
+      }
+
+      console.log(`[StockUpdate] Req: ID=${slot_id} Type=${change_type} Qty=${quantity}`);
       const quantity_before = slotInfo.current_stock;
+      console.log(`[StockUpdate] Before: ${quantity_before}`);
+      
+      // === IDEMPOTENCY CHECK START ===
+      const fiveSecondsAgo = new Date(Date.now() - 5000).toISOString();
+      let dbChangeType = change_type;
+      if (change_type === "REMOVE") dbChangeType = "MANUAL_ADJUST";
+      
+      const { data: recentLogs } = await supabase
+        .from("stock_logs")
+        .select("*")
+        .eq("slot_id", slot_id)
+        .eq("change_type", dbChangeType)
+        .gte("created_at", fiveSecondsAgo)
+        .order("created_at", { ascending: false })
+        .limit(1);
+
+      if (recentLogs && recentLogs.length > 0) {
+          const recent = recentLogs[0];
+          // Check for exact duplicate logic
+          let isDuplicate = false;
+          
+          if (change_type === "RESTOCK" && recent.quantity_change === quantity) isDuplicate = true;
+          if (change_type === "REMOVE" && recent.quantity_change === -quantity) isDuplicate = true;
+          // For MANUAL_ADJUST, we check if quantity_after matches what we want to set?
+          // But recent.quantity_change is delta.
+          // Let's assume manual adjust sets absolute, so quantity_after should match.
+          if (change_type === "MANUAL_ADJUST") {
+               // Calculate what our AFTER would be
+               const proposed_after = Math.min(Math.max(quantity, 0), slotInfo.capacity);
+               if (recent.quantity_after === proposed_after) isDuplicate = true;
+          }
+
+          if (isDuplicate) {
+             console.warn(`[StockUpdate] ⚠️ DUPLICATE DETECTED (Log ID: ${recent.id}). Ignoring.`);
+             return res.json({
+                 slot_id,
+                 machine_id: slotInfo.machine_id,
+                 slot_number: slotInfo.slot_number,
+                 change_type,
+                 quantity_before: recent.quantity_before, // Return existing
+                 quantity_after: recent.quantity_after,
+                 quantity_change: recent.quantity_change,
+                 reason: "Duplicate Request (Cached)",
+                 performed_by,
+                 updated_at: recent.created_at,
+                 is_duplicate: true
+             });
+          }
+      }
+      // === IDEMPOTENCY CHECK END ===
+
       let quantity_after = quantity;
       let quantity_change = 0;
 
@@ -180,10 +245,14 @@ router.post("/update", validateStockUpdate, async (req, res) => {
       } else if (change_type === "MANUAL_ADJUST") {
         quantity_after = Math.min(Math.max(quantity, 0), slotInfo.capacity);
         quantity_change = quantity_after - quantity_before;
+      } else if (change_type === "REMOVE") {
+        quantity_after = Math.max(quantity_before - quantity, 0);
+        quantity_change = quantity_after - quantity_before;
       } else if (change_type === "AUDIT") {
         quantity_after = Math.min(Math.max(quantity, 0), slotInfo.capacity);
         quantity_change = quantity_after - quantity_before;
       }
+      console.log(`[StockUpdate] Calc: ${quantity_before} -> ${quantity_after} (Change: ${quantity_change})`);
 
       // Update slot stock
       if (!USE_DB_TRIGGER) {
@@ -201,7 +270,7 @@ router.post("/update", validateStockUpdate, async (req, res) => {
         .insert({
             machine_id: slotInfo.machine_id,
             slot_id: slot_id,
-            change_type: change_type,
+            change_type: change_type === "REMOVE" ? "MANUAL_ADJUST" : change_type,
             quantity_before: quantity_before,
             quantity_after: quantity_after,
             quantity_change: quantity_change,
@@ -243,6 +312,18 @@ router.post("/update", validateStockUpdate, async (req, res) => {
         }
 
         const slotInfo = slot[0];
+
+        // OPTIMISTIC CONCURRENCY CHECK
+        if (expected_current_stock !== undefined) {
+            if (Number(expected_current_stock) !== Number(slotInfo.current_stock)) {
+                return res.status(409).json({
+                    error: "Data has changed",
+                    message: "Stok telah berubah di server. Silakan refresh dan coba lagi.",
+                    current_stock: slotInfo.current_stock
+                });
+            }
+        }
+
         const quantity_before = slotInfo.current_stock;
         let quantity_after = quantity;
         let quantity_change = 0;
@@ -253,6 +334,9 @@ router.post("/update", validateStockUpdate, async (req, res) => {
         quantity_change = quantity_after - quantity_before;
         } else if (change_type === "MANUAL_ADJUST") {
         quantity_after = Math.min(Math.max(quantity, 0), slotInfo.capacity);
+        quantity_change = quantity_after - quantity_before;
+        } else if (change_type === "REMOVE") {
+        quantity_after = Math.max(quantity_before - quantity, 0);
         quantity_change = quantity_after - quantity_before;
         } else if (change_type === "AUDIT") {
         quantity_after = Math.min(Math.max(quantity, 0), slotInfo.capacity);
@@ -277,7 +361,7 @@ router.post("/update", validateStockUpdate, async (req, res) => {
             [
             slotInfo.machine_id,
             slot_id,
-            change_type,
+            change_type === "REMOVE" ? "MANUAL_ADJUST" : change_type,
             quantity_before,
             quantity_after,
             quantity_change,
@@ -304,6 +388,8 @@ router.post("/update", validateStockUpdate, async (req, res) => {
     console.error("Update stock error:", error);
     res.status(500).json({
       error: "Failed to update stock",
+      details: error.message,
+      fullError: error
     });
   }
 });
