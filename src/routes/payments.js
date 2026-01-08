@@ -799,4 +799,73 @@ router.get("/:order_id", async (req, res) => {
   }
 });
 
+// Cancel payment manually or via user exit
+router.post("/cancel/:order_id", async (req, res) => {
+  try {
+    const { order_id } = req.params;
+    console.log(`🚫 Request to cancel order: ${order_id}`);
+
+    let order;
+
+    // 1. Check current status
+    if (USE_SUPABASE) {
+      const { data, error } = await supabase
+        .from("orders")
+        .select("status, payment_type")
+        .eq("id", order_id)
+        .single();
+      
+      if (error || !data) return res.status(404).json({ error: "Order not found" });
+      order = data;
+    } else {
+      const result = await db.query("SELECT status, payment_type FROM orders WHERE id = ?", [order_id]);
+      if (result.length === 0) return res.status(404).json({ error: "Order not found" });
+      order = result[0];
+    }
+
+    if (order.status === "PAID" || order.status === "SUCCESS") {
+        return res.status(400).json({ error: "Cannot cancel a paid order" });
+    }
+
+    if (order.status === "FAILED" || order.status === "CANCELLED") {
+        return res.json({ message: "Order already cancelled" });
+    }
+
+    // 2. Cancel in Midtrans (if applicable)
+    // Only if payment method involves midtrans/qris dynamically generated
+    try {
+        const midtransClient = require('midtrans-client');
+        let snap = new midtransClient.Snap({
+            isProduction: process.env.PAYMENT_IS_PRODUCTION === 'true',
+            serverKey: process.env.PAYMENT_SERVER_KEY,
+            clientKey: process.env.PAYMENT_CLIENT_KEY
+        });
+
+        // We use the same order_id (assuming it was used for midtrans)
+        // Ideally we should use the gateway_transaction_id if different, but usually we map 1:1 or suffix
+        // Let's try cancelling the base ID. Midtrans might return 404 if transaction doesn't exist yet, which is fine.
+        console.log(`🚫 Calling Midtrans Cancel for ${order_id}...`);
+        await snap.transaction.cancel(order_id);
+        console.log("✅ Midtrans cancel request sent");
+    } catch (midtransError) {
+        console.warn("⚠️ Midtrans cancel error (ignoring if transaction not found):", midtransError.message);
+    }
+
+    // 3. Update DB
+    if (USE_SUPABASE) {
+        await supabase.from("orders").update({ status: "CANCELLED" }).eq("id", order_id);
+        await supabase.from("payments").update({ status: "FAILED", transaction_status: "cancel" }).eq("order_id", order_id);
+    } else {
+        await db.query("UPDATE orders SET status = 'CANCELLED' WHERE id = ?", [order_id]);
+        await db.query("UPDATE payments SET status = 'FAILED', transaction_status = 'cancel' WHERE order_id = ?", [order_id]);
+    }
+
+    res.json({ message: "Order cancelled successfully" });
+
+  } catch (error) {
+    console.error("Cancel order error:", error);
+    res.status(500).json({ error: "Failed to cancel order" });
+  }
+});
+
 module.exports = router;
