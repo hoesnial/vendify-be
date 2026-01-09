@@ -11,13 +11,21 @@ class MqttService {
 
   async init() {
     try {
-      const brokerUrl = process.env.MQTT_BROKER_URL || "ws://broker.emqx.io:8083/mqtt";
+      // Use HiveMQ as default fallback if env vars are missing
+      const defaultBrokerHost = "5ab94abc71974f2c87741c0737fcb46e.s1.eu.hivemq.cloud";
+      const defaultBrokerPort = 8883;
+      const defaultBrokerUrl = `mqtts://${defaultBrokerHost}:${defaultBrokerPort}`;
+
+      const brokerUrl = process.env.MQTT_BROKER_URL || defaultBrokerUrl;
+      
       const options = {
         clientId: 'backend_' + Math.random().toString(16).substr(2, 8),
-        username: process.env.MQTT_USERNAME,
-        password: process.env.MQTT_PASSWORD,
+        username: process.env.MQTT_USERNAME || "espVenMac",
+        password: process.env.MQTT_PASSWORD || "Password123",
         reconnectPeriod: 5000,
         keepalive: 60,
+        protocol: 'mqtts', // Force secure connection for HiveMQ
+        rejectUnauthorized: true, // Required for HiveMQ Cloud
       };
 
       this.client = mqtt.connect(brokerUrl, options);
@@ -108,10 +116,29 @@ class MqttService {
           data: data,
         });
 
-        // Update machine last_seen
+        // Update machine last_seen and config with temperature
+        const { data: machineData } = await supabase
+          .from("machines")
+          .select("config")
+          .eq("id", machineId)
+          .single();
+
+        const currentConfig = machineData?.config || {};
+        const tempVal = data.temperature || data.temp || data.value;
+        const humVal = data.humidity || 0;
+        
+        const newConfig = {
+          ...currentConfig,
+          ...(tempVal !== undefined && { temperature: parseFloat(tempVal) }),
+          ...(humVal !== undefined && { humidity: parseFloat(humVal) })
+        };
+
         await supabase
           .from("machines")
-          .update({ last_seen: new Date().toISOString() })
+          .update({ 
+            last_seen: new Date().toISOString(),
+            config: newConfig
+          })
           .eq("id", machineId);
 
           // Process slot levels if provided
@@ -153,12 +180,19 @@ class MqttService {
         const humidity = data.humidity || 0;
 
         if (tempValue !== undefined) {
-          await supabase.from("temperature_logs").insert({
+          console.log(`🌡️  Processing temperature log for ${machineId}: ${tempValue}°C`);
+          
+          const { error: logError } = await supabase.from("temperature_logs").insert({
             machine_id: machineId,
             value: parseFloat(tempValue),
             humidity: parseFloat(humidity),
           });
-          console.log(`🌡️ Temperature logged for ${machineId}: ${tempValue}°C`);
+
+          if (logError) {
+             console.error("❌ Failed to insert temperature log to Supabase:", logError);
+          } else {
+             console.log(`✅ Temperature logged successfully for ${machineId}`);
+          }
         }
       } else {
         // MySQL implementation
@@ -171,12 +205,22 @@ class MqttService {
           [machineId, JSON.stringify(data)]
         );
 
-        // Update machine last_seen
+        // Update machine last_seen and config (MySQL)
+        // Note: simplified JSON update for MySQL 5.7/8.0
+        const tempVal = data.temperature || data.temp || data.value;
+        const humVal = data.humidity || 0;
+
+        let configUpdate = '';
+        const params = [];
+
+        if (tempVal !== undefined) {
+             configUpdate = ", config = JSON_SET(COALESCE(config, '{}'), '$.temperature', ?, '$.humidity', ?)";
+             params.push(tempVal, humVal);
+        }
+
         await db.query(
-          `
-          UPDATE machines SET last_seen = NOW() WHERE id = ?
-        `,
-          [machineId]
+          `UPDATE machines SET last_seen = NOW() ${configUpdate} WHERE id = ?`,
+          [...params, machineId]
         );
 
         // Process slot levels if provided
@@ -213,6 +257,29 @@ class MqttService {
               );
             }
           }
+        }
+
+        // Process Temperature/Humidity for MySQL
+        const tempValue = data.temperature || data.temp || data.value;
+        const humidity = data.humidity || 0;
+
+        if (tempValue !== undefined) {
+          // Ensure table exists
+          await db.query(`
+            CREATE TABLE IF NOT EXISTS temperature_logs (
+              id INT AUTO_INCREMENT PRIMARY KEY,
+              machine_id VARCHAR(50) NOT NULL,
+              value FLOAT NOT NULL,
+              humidity FLOAT,
+              created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+          `);
+
+          await db.query(
+            "INSERT INTO temperature_logs (machine_id, value, humidity) VALUES (?, ?, ?)",
+            [machineId, parseFloat(tempValue), parseFloat(humidity)]
+          );
+          console.log(`🌡️ Temperature logged for ${machineId}: ${tempValue}°C`);
         }
       }
     } catch (error) {
